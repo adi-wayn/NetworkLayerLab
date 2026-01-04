@@ -27,10 +27,44 @@
 */
 int main(int argc, char *argv[]) {
 
-	// Check the number of command-line arguments.
-	if (argc != 2)
-	{
-		fprintf(stderr, "Usage: %s <destination_ip>\n", argv[0]);
+	char *dest_ip = NULL;
+	int count = -1;     // -1 = אינסופי (ברירת מחדל)
+	int flood = 0;
+
+	int opt;
+	while ((opt = getopt(argc, argv, "a:c:f")) != -1) {
+		switch (opt) {
+			case 'a':
+				dest_ip = optarg;
+				break;
+
+			case 'c':
+				count = atoi(optarg);
+				if (count <= 0) {
+					fprintf(stderr, "Error: -c must be a positive integer\n");
+					return 1;
+				}
+				break;
+
+			case 'f':
+				flood = 1;
+				break;
+
+			default:
+				fprintf(stderr, "Usage: %s -a <ip> [-c <count>] [-f]\n", argv[0]);
+				return 1;
+		}
+	}
+
+	if (dest_ip == NULL) {
+		fprintf(stderr, "Error: -a <ip> is required\n");
+		fprintf(stderr, "Usage: %s -a <ip> [-c <count>] [-f]\n", argv[0]);
+		return 1;
+	}
+
+	if (optind < argc) {
+		fprintf(stderr, "Error: unexpected argument: %s\n", argv[optind]);
+		fprintf(stderr, "Usage: %s -a <ip> [-c <count>] [-f]\n", argv[0]);
 		return 1;
 	}
 
@@ -62,7 +96,7 @@ int main(int argc, char *argv[]) {
 
 	// Try to convert the destination IP address from the user input to a binary format.
 	// Could fail if the IP address is not valid.
-	if (inet_pton(AF_INET, argv[1], &destination_address.sin_addr) <= 0)
+	if (inet_pton(AF_INET,dest_ip, &destination_address.sin_addr) <= 0)
 	{
 		fprintf(stderr, "Error: \"%s\" is not a valid IPv4 address\n", argv[1]);
 		return 1;
