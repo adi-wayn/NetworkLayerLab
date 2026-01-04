@@ -19,7 +19,7 @@
  * @attention If the socket is not ready for reading after this amount of time, the function will return 0.
  * @note The default value is 2000 milliseconds (2 seconds).
 */
-#define TIMEOUT 2000
+#define TIMEOUT 10000
 
 /*
  * @brief Size of the buffer used to store the ICMP packet (including the header).

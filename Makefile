@@ -1,34 +1,24 @@
 #######################################
-# 	Makefile for the ping program.    #
-#	For: Computer Networks course.    #
-#	Free to use and distribute.       #
+#  Makefile for the ping program.     #
+#  For: Computer Networks course.     #
 #######################################
 
-# Use the gcc compiler.
 CC = gcc
-
-# Flags for the compiler. Can also use -g for debugging.
 CFLAGS = -Wall -Wextra -Werror -std=c99 -pedantic
+LDFLAGS = -lm
 
-# Command to remove files.
 RM = rm -f
 
-# Header files.
 HEADERS = ping.h
-
-# Executable files.
 EXECS = ping
 
-# IP address to ping.
+# Default arguments
 IP = 1.1.1.1
+COUNT = 4
 
-# Phony targets - targets that are not files but commands to be executed by make.
-.PHONY: all default clean runp runsp
+.PHONY: all default clean runp runpc runpf runpfc runsp
 
-# Default target - compile everything and create the executables and libraries.
 all: $(EXECS)
-
-# Alias for the default target.
 default: all
 
 
@@ -36,33 +26,45 @@ default: all
 # Programs #
 ############
 
-# Compile the ping program.
 $(EXECS): $(EXECS).o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 
 ################
 # Run programs #
 ################
 
-# Run ping program in sudo mode.
+# Run ping program in sudo mode (default: infinite)
 runp: $(EXECS)
-	sudo ./$< $(IP)
+	sudo ./$< -a $(IP)
+
+# Run ping with count (-c)
+runpc: $(EXECS)
+	sudo ./$< -a $(IP) -c $(COUNT)
+
+# Run ping with flood (-f)
+runpf: $(EXECS)
+	sudo ./$< -a $(IP) -f
+
+# Run ping with count + flood
+runpfc: $(EXECS)
+	sudo ./$< -a $(IP) -c $(COUNT) -f
+
 
 ################
 # System Trace #
 ################
 
-# Run the ping program with system trace (sudo mode).
+# System trace for default mode
 runsp: $(EXECS)
-	sudo strace ./$< $(IP)
+	sudo strace ./$< -a $(IP)
+
 
 ################
 # Object files #
 ################
 
-# Compile all the C files into object files.
-%.o: %.c
+%.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 
@@ -70,6 +72,5 @@ runsp: $(EXECS)
 # Cleanup files #
 #################
 
-# Remove all the object files, shared libraries and executables.
 clean:
 	$(RM) *.o *.so $(EXECS)

@@ -18,6 +18,8 @@
 #include <sys/time.h> // Time types (struct timeval and gettimeofday)
 #include <unistd.h> // UNIX standard function definitions (getpid, close, sleep)
 #include <getopt.h> // Command-line argument parsing (getopt)
+#include <signal.h> // Signal handling (signal, SIGINT)
+#include <math.h> // Mathematical functions (sqrt)
 #include "ping.h" // Header file for the program (calculate_checksum function and some constants)
 
 /*
@@ -27,6 +29,14 @@
  * @return 0 on success, 1 on failure.
  * @note The program requires one command-line argument: the destination IP address.
 */
+
+volatile sig_atomic_t stop = 0;
+
+void handle_sigint(int sig) {
+    (void)sig;
+    stop = 1;
+}
+
 int main(int argc, char *argv[]) {
 
 	char *dest_ip = NULL;
@@ -70,6 +80,8 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	signal(SIGINT, handle_sigint);
+
 	// Structure to store the destination address.
 	// Even though we are using raw sockets, creating from zero the IP header is a bit complex,
 	// we use the structure to store the destination address.
@@ -86,9 +98,6 @@ int main(int argc, char *argv[]) {
 	// We need to add 1 to the size of the payload, as we need to include the null-terminator of the string.
 	int payload_size = strlen(msg) + 1;
 
-	// Number of retries for the ping request.
-	int retries = 0;
-
 	// Reset the destination address structure to zero, to make sure there are no garbage values.
 	// As we only need to set the IP address and the family, we can set the rest of the structure to zero.
 	memset(&destination_address, 0, sizeof(destination_address));
@@ -100,7 +109,7 @@ int main(int argc, char *argv[]) {
 	// Could fail if the IP address is not valid.
 	if (inet_pton(AF_INET,dest_ip, &destination_address.sin_addr) <= 0)
 	{
-		fprintf(stderr, "Error: \"%s\" is not a valid IPv4 address\n", argv[1]);
+		fprintf(stderr, "Error: \"%s\" is not a valid IPv4 address\n", dest_ip);
 		return 1;
 	}
 
@@ -137,7 +146,17 @@ int main(int argc, char *argv[]) {
 	// The sequence number of the ping request.
 	// It starts at 0 and is incremented by 1 for each new request.
 	// Good for identifying the order of the requests.
-	int seq = 0;
+	int seq = 1;
+	int sent = 0;
+	int received = 0;
+
+	double rtt_min = 0.0;
+	double rtt_max = 0.0;
+	double rtt_sum = 0.0;
+	double rtt_sum_sq = 0.0;
+
+	struct timeval program_start, program_end;
+	gettimeofday(&program_start, NULL);
 
 	// Create a pollfd structure to wait for the socket to become ready for reading.
 	// Used for receiving the ICMP reply packet, as it may take some time to arrive or not arrive at all.
@@ -149,10 +168,10 @@ int main(int argc, char *argv[]) {
 	// Set the events to wait for to POLLIN, which means the socket is ready for reading.
 	fds[0].events = POLLIN;
 
-	fprintf(stdout, "PING %s with %d bytes of data:\n", argv[1], payload_size);
+	fprintf(stdout, "Pinging %s with %d bytes of data:\n", dest_ip, payload_size);
 
 	// The main loop of the program.
-	while (1)
+	while (!stop && (count == -1 || sent < count))
 	{
 		// Zero out the buffer to make sure there are no garbage values.
 		memset(buffer, 0, sizeof(buffer));
@@ -189,26 +208,23 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 
+		sent++;
+
 		// Poll the socket to wait for the ICMP reply packet.
 		int ret = poll(fds, 1, TIMEOUT);
 
 		// The poll(2) function returns 0 if the socket is not ready for reading after the timeout.
-		if (ret == 0)
-		{
-			if (++retries == MAX_RETRY)
-			{
-				fprintf(stderr, "Request timeout for icmp_seq %d, aborting.\n", seq);
-				break;
-			}
-
-			fprintf(stderr, "Request timeout for icmp_seq %d, retrying...\n", seq);
-			--seq; // Decrement the sequence number to send the same request again.
-			continue;
+		if (ret == 0){
+			fprintf(stderr, "Request timeout for icmp_seq %d, aborting.\n", seq - 1);
+			break;
 		}
 
 		// The poll(2) function returns a negative value if an error occurs.
-		else if (ret < 0)
-		{
+		else if (ret < 0){
+			if (errno == EINTR) {
+				// poll was interrupted by SIGINT (Ctrl+C)
+				break;
+			}
 			perror("poll(2)");
 			close(sock);
 			return 1;
@@ -233,9 +249,6 @@ int main(int argc, char *argv[]) {
 				return 1;
 			}
 
-			// Reset the number of retries to 0, as we received a reply packet.
-			retries = 0;
-
 			// Calculate the time it takes to send and receive the packet.
 			gettimeofday(&end, NULL);
 
@@ -253,6 +266,19 @@ int main(int argc, char *argv[]) {
 			{
 				// Calculate the time it takes to send and receive the packet.
 				float pingPongTime = ((float)(end.tv_usec - start.tv_usec) / 1000) + ((end.tv_sec - start.tv_sec) * 1000);
+				received++;
+
+				rtt_sum += pingPongTime;
+				rtt_sum_sq += pingPongTime * pingPongTime;
+				if (received == 1) {
+					rtt_min = pingPongTime;
+					rtt_max = pingPongTime;
+				}
+				else {
+					if (pingPongTime < rtt_min) rtt_min = pingPongTime;
+					if (pingPongTime > rtt_max) rtt_max = pingPongTime;
+				}
+
 
 				// Print the result of the ping request.
 				// The result includes the number of bytes received (the payload size),
@@ -263,21 +289,49 @@ int main(int argc, char *argv[]) {
 						ntohs(icmp_header->un.echo.sequence),
 						ip_header->ttl, 
 						pingPongTime);
-
-				// Optional: Break the loop after a certain number of requests.
-				// This will make the ping work like Windows' ping, which sends 4 requests by default.
-				// Linux default ping uses infinite requests.
-				if (seq == MAX_REQUESTS)
-				 	break;
 			}
 
 			// If the ICMP packet isn't an ECHO REPLY packet, we need to print an error message.
-			else
-				fprintf(stderr, "Error: packet received with type %d\n", icmp_header->type);
+			else {
+				fprintf(stderr, "ICMP error from %s: type=%d code=%d (unreachable/other)\n",
+					inet_ntoa(source_address.sin_addr),
+					icmp_header->type,
+					icmp_header->code);
+				break;
+			}
 		}
 
 		// Sleep for 1 second before sending the next request.
-		sleep(SLEEP_TIME);
+		if (!flood)
+			sleep(SLEEP_TIME);
+	}
+
+	gettimeofday(&program_end, NULL);
+
+	double total_time_ms =
+		(program_end.tv_sec - program_start.tv_sec) * 1000.0 +
+		(program_end.tv_usec - program_start.tv_usec) / 1000.0;
+
+	int loss = sent - received;
+	double loss_percent = (sent > 0) ? ((double)loss / sent) * 100.0 : 0.0;
+	double avg_rtt = (received > 0) ? (rtt_sum / received) : 0.0;
+
+	double mdev = 0.0;
+	if (received > 0) {
+		double mean = avg_rtt;
+		double variance = (rtt_sum_sq / received) - (mean * mean);
+		if (variance < 0) variance = 0;  // בגלל floating point errors
+		mdev = sqrt(variance);
+	}
+
+
+	printf("\n--- %s ping statistics ---\n", dest_ip);
+	printf("%d packets transmitted, %d received, %.1f%% packet loss, time %.2fms\n",
+		sent, received, loss_percent, total_time_ms);
+
+	if (received > 0) {
+		printf("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3fms\n",
+       rtt_min, avg_rtt, rtt_max, mdev);
 	}
 
 	// Close the socket and return 0 to the operating system.
