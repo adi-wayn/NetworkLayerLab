@@ -6,6 +6,7 @@
 */
 
 #include <stdio.h> // Standard input/output definitions
+#include <stdlib.h> // Standard library definitions (exit, atoi)
 #include <arpa/inet.h> // Definitions for internet operations (inet_pton, inet_ntoa)
 #include <netinet/in.h> // Internet address family (AF_INET, AF_INET6)
 #include <netinet/ip.h> // Definitions for internet protocol operations (IP header)
@@ -16,6 +17,7 @@
 #include <sys/socket.h> // Definitions for socket operations (socket, sendto, recvfrom)
 #include <sys/time.h> // Time types (struct timeval and gettimeofday)
 #include <unistd.h> // UNIX standard function definitions (getpid, close, sleep)
+#include <getopt.h> // Command-line argument parsing (getopt)
 #include "ping.h" // Header file for the program (calculate_checksum function and some constants)
 
 /*
