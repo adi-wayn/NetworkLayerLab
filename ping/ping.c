@@ -86,7 +86,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	if (dest_ip == NULL) {
+	if (!dest_ip) {
 		fprintf(stderr, "Error: -a <ip> is required\n");
 		fprintf(stderr, "Usage: %s -a <ip> [-c <count>] [-f]\n", argv[0]);
 		return 1;

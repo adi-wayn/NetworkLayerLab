@@ -4,7 +4,7 @@
 #######################################
 
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -std=c99 -pedantic
+CFLAGS = -Wall -Wextra -Werror -std=c99 -pedantic -I..
 LDFLAGS = -lm
 
 RM = rm -f
@@ -13,8 +13,14 @@ RM = rm -f
 HEADERS = net_utils.h
 
 # Sources
-SRCS = ping.c net_utils.c
-OBJS = $(SRCS:.c=.o)
+OBJS = ping.o net_utils.o
+
+ping.o: ping.c ../net_utils.h
+	$(CC) $(CFLAGS) -c ping.c
+
+net_utils.o: ../net_utils.c ../net_utils.h
+	$(CC) $(CFLAGS) -c ../net_utils.c -o net_utils.o
+
 
 # Executable
 EXECS = ping

@@ -33,4 +33,18 @@ int recv_icmp_packet(int sock, char *buf, int bufsize,
 // extracts pointers inside recv buffer
 void parse_ip_icmp(const char *buf, struct iphdr **ip, struct icmphdr **icmp);
 
+// ===== Build IPv4 Header =====
+int build_ipv4_header(char *buf, int bufsize, const char *src_ip, const char *dst_ip,
+                      int ttl, int payload_len);
+
+// ===== Build Packet for Traceroute =====
+int build_packet_for_traceroute(char *buf, int bufsize,
+                                const char *src_ip,
+                                const char *dst_ip,
+                                int ttl,
+                                uint16_t id,
+                                uint16_t seq,
+                                const void *payload,
+                                int payload_len);
+
 #endif

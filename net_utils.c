@@ -96,3 +96,86 @@ void parse_ip_icmp(const char *buf, struct iphdr **ip, struct icmphdr **icmp)
     *ip = (struct iphdr *)buf;
     *icmp = (struct icmphdr *)(buf + (*ip)->ihl * 4);
 }
+
+// ===== Build IPv4 Header =====
+int build_ipv4_header(char *buf, int bufsize, const char *src_ip, const char *dst_ip,
+                      int ttl, int payload_len){
+
+    if (bufsize < (int)sizeof(struct iphdr))
+        return -1;
+
+    struct iphdr *ip = (struct iphdr *)buf;
+    memset(ip, 0, sizeof(struct iphdr));
+
+    ip->version = 4;
+    ip->ihl = 5;
+    ip->tos = 0;
+    ip->tot_len = htons(sizeof(struct iphdr) + payload_len);
+
+    // Identification with a counter
+    static uint16_t ip_id_counter = 0;
+    ip->id = htons(ip_id_counter++);
+
+    ip->frag_off = htons(0);
+    ip->ttl = ttl;
+    ip->protocol = IPPROTO_ICMP;
+    ip->check = 0;
+
+    // Source address
+    if (src_ip != NULL) {
+        if (inet_pton(AF_INET, src_ip, &ip->saddr) != 1)
+            return -1;
+    } else {
+        ip->saddr = 0; // Let the OS fill in the source address
+    }
+
+    // Destination address
+    if (inet_pton(AF_INET, dst_ip, &ip->daddr) != 1)
+        return -1;
+
+    // Compute IPv4 header checksum (only header bytes)
+    ip->check = calculate_checksum(ip, sizeof(struct iphdr));
+
+    return sizeof(struct iphdr);
+}
+
+// ===== Build Packet for Traceroute =====
+int build_packet_for_traceroute(char *buf, int bufsize,
+                                const char *src_ip,
+                                const char *dst_ip,
+                                int ttl,
+                                uint16_t id,
+                                uint16_t seq,
+                                const void *payload,
+                                int payload_len){
+                                    
+    int ip_len = sizeof(struct iphdr);
+
+    if (bufsize < ip_len)
+        return -1;
+
+    /* 1) Build ICMP inside the buffer AFTER the IP header */
+    int icmp_len = build_icmp_echo_request(buf + ip_len,
+                                          bufsize - ip_len,
+                                          id,
+                                          seq,
+                                          payload,
+                                          payload_len);
+
+    if (icmp_len < 0)
+        return -1;
+
+    /* 2) Build IPv4 header at the start of the buffer */
+    int res = build_ipv4_header(buf,
+                                bufsize,
+                                src_ip,
+                                dst_ip,
+                                ttl,
+                                icmp_len);
+
+    if (res < 0)
+        return -1;
+
+    /* Total packet length = IP header + ICMP */
+    return ip_len + icmp_len;
+}
