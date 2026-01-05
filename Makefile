@@ -9,7 +9,14 @@ LDFLAGS = -lm
 
 RM = rm -f
 
-HEADERS = ping.h
+# Headers
+HEADERS = net_utils.h
+
+# Sources
+SRCS = ping.c net_utils.c
+OBJS = $(SRCS:.c=.o)
+
+# Executable
 EXECS = ping
 
 # Default arguments
@@ -26,7 +33,7 @@ default: all
 # Programs #
 ############
 
-$(EXECS): $(EXECS).o
+$(EXECS): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 

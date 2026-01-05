@@ -11,7 +11,6 @@
 #include <netinet/in.h> // Internet address family (AF_INET, AF_INET6)
 #include <netinet/ip.h> // Definitions for internet protocol operations (IP header)
 #include <netinet/ip_icmp.h> // Definitions for internet control message protocol operations (ICMP header)
-#include <poll.h> // Poll API for monitoring file descriptors (poll)
 #include <errno.h> // Error number definitions. Used for error handling (EACCES, EPERM)
 #include <string.h> // String manipulation functions (strlen, memset, memcpy)
 #include <sys/socket.h> // Definitions for socket operations (socket, sendto, recvfrom)
@@ -20,7 +19,26 @@
 #include <getopt.h> // Command-line argument parsing (getopt)
 #include <signal.h> // Signal handling (signal, SIGINT)
 #include <math.h> // Mathematical functions (sqrt)
-#include "ping.h" // Header file for the program (calculate_checksum function and some constants)
+#include "net_utils.h" // Header file for the program (calculate_checksum function and some constants)
+
+
+/****************************************************************************************
+ * 										CONSTANTS										*
+ ****************************************************************************************/
+
+/*
+ * @brief Timeout value in milliseconds for the poll(2) function.
+ * @note The poll(2) function will wait for this amount of time for the socket to become ready for reading.
+ * @attention If the socket is not ready for reading after this amount of time, the function will return 0.
+ * @note The default value is 2000 milliseconds (2 seconds).
+*/
+#define TIMEOUT 10000
+
+/*
+ * @brief The time to sleep between sending ping requests in seconds.
+ * @note Default value is 1 second.
+*/
+#define SLEEP_TIME 1
 
 /*
  * @brief Main function of the program.
@@ -129,20 +147,6 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	// Create an ICMP header structure and set the fields to the desired values.
-	struct icmphdr icmp_header;
-
-	// Set the type of the ICMP packet to ECHO REQUEST (PING).
-	icmp_header.type = ICMP_ECHO;
-
-	// Set the code of the ICMP packet to 0 (As it isn't used in the ECHO type).
-	icmp_header.code = 0;
-
-	// Set the ping identifier to the process ID of the program.
-	// This field is used to identify the ping request.
-	// Each program has a different process ID, so it's a good value to use.
-	icmp_header.un.echo.id = htons(getpid());
-
 	// The sequence number of the ping request.
 	// It starts at 0 and is incremented by 1 for each new request.
 	// Good for identifying the order of the requests.
@@ -158,16 +162,6 @@ int main(int argc, char *argv[]) {
 	struct timeval program_start, program_end;
 	gettimeofday(&program_start, NULL);
 
-	// Create a pollfd structure to wait for the socket to become ready for reading.
-	// Used for receiving the ICMP reply packet, as it may take some time to arrive or not arrive at all.
-	struct pollfd fds[1];
-
-	// Set the file descriptor of the socket to the pollfd structure.
-	fds[0].fd = sock;
-
-	// Set the events to wait for to POLLIN, which means the socket is ready for reading.
-	fds[0].events = POLLIN;
-
 	fprintf(stdout, "Pinging %s with %d bytes of data:\n", dest_ip, payload_size);
 
 	// The main loop of the program.
@@ -176,33 +170,29 @@ int main(int argc, char *argv[]) {
 		// Zero out the buffer to make sure there are no garbage values.
 		memset(buffer, 0, sizeof(buffer));
 
-		// Set the sequence number of the ping request, and update the value for the next request.
-		icmp_header.un.echo.sequence = htons(seq++);
+		// Build the ICMP ECHO REQUEST packet.
+		int pkt_len = build_icmp_echo_request(
+			buffer, sizeof(buffer),
+			(uint16_t)getpid(),
+			(uint16_t)seq,
+			msg, payload_size);
 
-		// Set the checksum of the ICMP packet to 0, as we need to calculate it.
-		icmp_header.checksum = 0;
+		// Error handling if the packet building fails.
+		if (pkt_len < 0) {
+			fprintf(stderr, "Failed to build ICMP packet\n");
+			break;
+		}
 
-		// Copy the ICMP header structure to the buffer.
-		memcpy(buffer, &icmp_header, sizeof(icmp_header));
+		// Increment the sequence number for the next request.		
+		seq++;
 
-		// Copy the payload of the ICMP packet to the buffer.
-		memcpy(buffer + sizeof(icmp_header), msg, payload_size);
-
-		// Calculate the checksum of the ICMP packet.
-		icmp_header.checksum = calculate_checksum(buffer, sizeof(icmp_header) + payload_size);
-
-		// Set the checksum of the ICMP packet to the calculated value.
-		// Instead of using the memcpy function, we can just set the value directly.
-		struct icmphdr *pckt_hdr = (struct icmphdr *)buffer;
-		pckt_hdr->checksum = icmp_header.checksum;
 
 		// Calculate the time it takes to send and receive the packet.
 		struct timeval start, end;
 		gettimeofday(&start, NULL);
 
 		// Try to send the ICMP packet to the destination address.
-		if (sendto(sock, buffer, (sizeof(icmp_header) + payload_size), 0, (struct sockaddr *)&destination_address, sizeof(destination_address)) <= 0)
-		{
+		if (sendto(sock, buffer, pkt_len, 0,(struct sockaddr *)&destination_address, sizeof(destination_address)) <= 0){
 			perror("sendto(2)");
 			close(sock);
 			return 1;
@@ -210,95 +200,64 @@ int main(int argc, char *argv[]) {
 
 		sent++;
 
-		// Poll the socket to wait for the ICMP reply packet.
-		int ret = poll(fds, 1, TIMEOUT);
+		/* ===== receive ICMP reply using net_utils ===== */
+		struct sockaddr_in source_address;
+		memset(&source_address, 0, sizeof(source_address));
 
-		// The poll(2) function returns 0 if the socket is not ready for reading after the timeout.
-		if (ret == 0){
+		int n = recv_icmp_packet(sock, buffer, sizeof(buffer),
+								&source_address, TIMEOUT);
+
+		if (n == 0) {
 			fprintf(stderr, "Request timeout for icmp_seq %d, aborting.\n", seq - 1);
 			break;
 		}
-
-		// The poll(2) function returns a negative value if an error occurs.
-		else if (ret < 0){
-			if (errno == EINTR) {
-				// poll was interrupted by SIGINT (Ctrl+C)
-				break;
-			}
-			perror("poll(2)");
+		if (n == -2) {
+			/* Interrupted by Ctrl+C (EINTR) */
+			break;
+		}
+		if (n < 0) {
+			perror("recv_icmp_packet");
 			close(sock);
 			return 1;
 		}
 
-		// Now we need to check if the socket actually has data to read.
-		if (fds[0].revents & POLLIN)
-		{
-			// Temporary structure to store the source address of the ICMP reply packet.
-			struct sockaddr_in source_address;
+		/* We got a packet */
+		gettimeofday(&end, NULL);
 
-			// Zero out the buffer and the source address structure to make sure there are no garbage values.
-			memset(buffer, 0, sizeof(buffer));
-			memset(&source_address, 0, sizeof(source_address));
+		/* Parse headers */
+		struct iphdr *ip_header;
+		struct icmphdr *icmp_header;
+		parse_ip_icmp(buffer, &ip_header, &icmp_header);
 
-			// Try to receive the ICMP reply packet from the destination address.
-			// Shouldn't fail, as we already checked if the socket is ready for reading.
-			if (recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&source_address, &(socklen_t){sizeof(source_address)}) <= 0)
-			{
-				perror("recvfrom(2)");
-				close(sock);
-				return 1;
+		/* Handle reply */
+		if (icmp_header->type == ICMP_ECHOREPLY) {
+			float pingPongTime = ((float)(end.tv_usec - start.tv_usec) / 1000) +
+								((end.tv_sec - start.tv_sec) * 1000);
+			received++;
+
+			rtt_sum += pingPongTime;
+			rtt_sum_sq += pingPongTime * pingPongTime;
+			if (received == 1) {
+				rtt_min = pingPongTime;
+				rtt_max = pingPongTime;
+			} else {
+				if (pingPongTime < rtt_min) rtt_min = pingPongTime;
+				if (pingPongTime > rtt_max) rtt_max = pingPongTime;
 			}
 
-			// Calculate the time it takes to send and receive the packet.
-			gettimeofday(&end, NULL);
-
-			// Start to extract the IP header and the ICMP header from the received packet.
-			struct iphdr *ip_header = (struct iphdr *)buffer;
-
-			// ICMP header is located after the IP header, so we need to skip the IP header.
-			// IP header size is determined by the ihl field, which is the first 4 bits of the header.
-			// The ihl field is the number of 32-bit words in the header, so we need to multiply it by 4 to get the size in bytes.
-			struct icmphdr *icmp_header = (struct icmphdr *)(buffer + ip_header->ihl * 4);
-
-			// Check if the ICMP packet is an ECHO REPLY packet.
-			// We may receive other types of ICMP packets, so we need to check the type field.
-			if (icmp_header->type == ICMP_ECHOREPLY)
-			{
-				// Calculate the time it takes to send and receive the packet.
-				float pingPongTime = ((float)(end.tv_usec - start.tv_usec) / 1000) + ((end.tv_sec - start.tv_sec) * 1000);
-				received++;
-
-				rtt_sum += pingPongTime;
-				rtt_sum_sq += pingPongTime * pingPongTime;
-				if (received == 1) {
-					rtt_min = pingPongTime;
-					rtt_max = pingPongTime;
-				}
-				else {
-					if (pingPongTime < rtt_min) rtt_min = pingPongTime;
-					if (pingPongTime > rtt_max) rtt_max = pingPongTime;
-				}
-
-
-				// Print the result of the ping request.
-				// The result includes the number of bytes received (the payload size),
-				// the destination IP address, the sequence number, the TTL value, and the time it takes to send and receive the packet.
-				fprintf(stdout, "%ld bytes from %s: icmp_seq=%d ttl=%d time=%.2fms\n",
-						(ntohs(ip_header->tot_len) - (ip_header->ihl * 4) - sizeof(struct icmphdr)), 
-						inet_ntoa(source_address.sin_addr),
-						ntohs(icmp_header->un.echo.sequence),
-						ip_header->ttl, 
-						pingPongTime);
-			}
-
-			// If the ICMP packet isn't an ECHO REPLY packet, we need to print an error message.
-			else {
-				fprintf(stderr, "ICMP error from %s: type=%d code=%d (unreachable/other)\n",
+			fprintf(stdout, "%ld bytes from %s: icmp_seq=%d ttl=%d time=%.2fms\n",
+					(ntohs(ip_header->tot_len) - (ip_header->ihl * 4) - sizeof(struct icmphdr)),
+					inet_ntoa(source_address.sin_addr),
+					ntohs(icmp_header->un.echo.sequence),
+					ip_header->ttl,
+					pingPongTime);
+		}
+		else {
+			fprintf(stderr, "ICMP error from %s: type=%d code=%d (unreachable/other)\n",
 					inet_ntoa(source_address.sin_addr),
 					icmp_header->type,
 					icmp_header->code);
-				break;
-			}
+			break;
 		}
 
 		// Sleep for 1 second before sending the next request.
@@ -338,27 +297,4 @@ int main(int argc, char *argv[]) {
 	close(sock);
 
 	return 0;
-}
-
-unsigned short int calculate_checksum(void *data, unsigned int bytes) {
-	unsigned short int *data_pointer = (unsigned short int *)data;
-	unsigned int total_sum = 0;
-
-	// Main summing loop.
-	while (bytes > 1)
-	{
-		total_sum += *data_pointer++; // Some magic pointer arithmetic.
-		bytes -= 2;
-	}
-
-	// Add left-over byte, if any.
-	if (bytes > 0)
-		total_sum += *((unsigned char *)data_pointer);
-
-	// Fold 32-bit sum to 16 bits.
-	while (total_sum >> 16)
-		total_sum = (total_sum & 0xFFFF) + (total_sum >> 16);
-
-	// Return the one's complement of the result.
-	return (~((unsigned short int)total_sum));
 }
