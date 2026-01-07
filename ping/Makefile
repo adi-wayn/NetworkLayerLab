@@ -4,12 +4,25 @@
 #######################################
 
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -std=c99 -pedantic
+CFLAGS = -Wall -Wextra -Werror -std=c99 -pedantic -I..
 LDFLAGS = -lm
 
 RM = rm -f
 
-HEADERS = ping.h
+# Headers
+HEADERS = net_utils.h
+
+# Sources
+OBJS = ping.o net_utils.o
+
+ping.o: ping.c ../net_utils.h
+	$(CC) $(CFLAGS) -c ping.c
+
+net_utils.o: ../net_utils.c ../net_utils.h
+	$(CC) $(CFLAGS) -c ../net_utils.c -o net_utils.o
+
+
+# Executable
 EXECS = ping
 
 # Default arguments
@@ -26,7 +39,7 @@ default: all
 # Programs #
 ############
 
-$(EXECS): $(EXECS).o
+$(EXECS): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 
