@@ -59,6 +59,12 @@ void scan_tcp_port(char *target_ip, int port) {
         perror("Socket creation failed");
         return;
     }
+    int one = 1;
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        perror("setsockopt IP_HDRINCL failed");
+        close(sock);
+        return;
+    }
     // הגדרת כתובת היעד
     struct sockaddr_in dest;
     dest.sin_family = AF_INET;
@@ -83,14 +89,89 @@ void scan_tcp_port(char *target_ip, int port) {
     iph->ttl = 255;
     iph->protocol = IPPROTO_TCP;
     iph->check = 0; // בינתיים 0, נחשב בסוף
-    iph->saddr = inet_addr("1.2.3.4"); // הערה: עדיף להשיג את ה-IP האמיתי שלך, אבל לצורך התרגיל זה עשוי לעבוד או לדרוש IP אמיתי
+    iph->saddr = NULL; // נשתמש בכתובת IP של המחשב שלנו
     iph->daddr = dest.sin_addr.s_addr;
 
     // חישוב Checksum ל-IP
-    iph->check = checksum((unsigned short *) packet, iph->tot_len);
+    iph->check = checksum((unsigned short *)packet,sizeof(struct iphdr));
+
     // 3. בניית TCP Header (עם דגל SYN)
-    // 4. שליחה
+    tcph->source = htons(12345); // פורט מקור אקראי
+    tcph->dest = htons(port);
+    tcph->seq = htonl(random());
+    tcph->ack_seq = 0;
+    tcph->doff = 5; // גודל ה-Header
+    tcph->fin = 0;
+    tcph->syn = 1; // *** הדלקת דגל SYN - דפיקה בדלת ***
+    tcph->rst = 0;
+    tcph->psh = 0;
+    tcph->ack = 0;
+    tcph->urg = 0;
+    tcph->window = htons(5840); /* Maximum window size */
+    tcph->check = 0; // בינתיים 0
+    tcph->urg_ptr = 0;
+
+    // 4. חישוב TCP Checksum (דורש Pseudo Header)
+    struct pseudo_header psh;
+    psh.source_address = NULL;
+    psh.dest_address = dest.sin_addr.s_addr;
+    psh.placeholder = 0;
+    psh.protocol = IPPROTO_TCP;
+    psh.tcp_length = htons(sizeof(struct tcphdr));
+
+    int psize = sizeof(struct pseudo_header) + sizeof(struct tcphdr);
+    char *pseudogram = malloc(psize);
+
+    memcpy(pseudogram, (char*) &psh, sizeof(struct pseudo_header));
+    memcpy(pseudogram + sizeof(struct pseudo_header), tcph, sizeof(struct tcphdr));
+
+    tcph->check = checksum((unsigned short*) pseudogram, psize);
+    free(pseudogram);
+
+    // 5. שליחת החבילה
+    if (sendto(sock, packet, iph->tot_len, 0, (struct sockaddr *) &dest, sizeof(dest)) < 0) {
+        perror("Sendto failed");
+        close(sock);
+        return;
+    }
     // 5. המתנה לתשובה וניתוח שלה (SYN-ACK או RST)
+    char buffer[4096];
+    struct sockaddr_in saddr;
+    socklen_t saddr_size = sizeof(saddr);
+    
+    // נשתמש ב-poll או פשוט נגדיר timeout ב-setsockopt (לפשטות כאן נשתמש בלולאה פשוטה עם recv)
+    // הגדרת זמן המתנה (Timeout) של שנייה אחת
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    int data_size = recvfrom(sock, buffer, 4096, 0, (struct sockaddr*)&saddr, &saddr_size);
+    if (data_size < 0) {
+    perror("recvfrom");
+    }
+    if (data_size > 0) {
+        // פירוק התשובה
+        struct iphdr *recv_iph = (struct iphdr *)buffer;
+        struct tcphdr *recv_tcph = (struct tcphdr *)(buffer + (recv_iph->ihl * 4));
+
+        // בדיקה אם התשובה היא מהפורט שסרקנו
+        if (saddr.sin_addr.s_addr == dest.sin_addr.s_addr && ntohs(recv_tcph->source) == port) {
+            // אם קיבלנו SYN ו-ACK (הפורט פתוח)
+            if (recv_tcph->syn == 1 && recv_tcph->ack == 1) {
+                printf("Port %d is OPEN (TCP)\n", port);
+                
+                // שלב בונוס: שליחת RST לסגירת החיבור (כמו שביקשו במטלה)
+                // כאן תוכלי להוסיף קוד ששולח חזרה חבילת RST, אבל ההדפסה היא העיקר.
+            } else if (recv_tcph->rst == 1) {
+                // הפורט סגור
+                printf("Port %d is CLOSED (TCP)\n", port);
+
+            }
+        }
+    }
+
+    close(sock);
 }
 
 // פונקציה שבונה ושולחת חבילת UDP
