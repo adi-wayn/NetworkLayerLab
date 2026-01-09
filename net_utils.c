@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+#include <errno.h>
+#include <sys/socket.h>
 
 // ===== Checksum =====
 unsigned short int calculate_checksum(void *data, unsigned int bytes) {
@@ -178,4 +180,169 @@ int build_packet_for_traceroute(char *buf, int bufsize,
 
     /* Total packet length = IP header + ICMP */
     return ip_len + icmp_len;
+}
+int get_local_ip_for_target(const char *target_ip, char *out_ip, size_t out_sz)
+{
+    if (!target_ip || !out_ip || out_sz == 0) return -1;
+
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(53); // לא באמת שולחים, רק כדי שהקרנל יבחר route
+    if (inet_pton(AF_INET, target_ip, &dst.sin_addr) != 1) {
+        close(s);
+        return -1;
+    }
+     if (connect(s, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        close(s);
+        return -1;
+    }
+
+    struct sockaddr_in name;
+    socklen_t namelen = sizeof(name);
+    if (getsockname(s, (struct sockaddr *)&name, &namelen) < 0) {
+        close(s);
+        return -1;
+    }
+
+    if (!inet_ntop(AF_INET, &name.sin_addr, out_ip, out_sz)) {
+        close(s);
+        return -1;
+    }
+       close(s);
+    return 0;
+}
+static int build_ipv4_header_tcp(char *packet, int packet_size,
+                                 const char *src_ip, const char *dst_ip,
+                                 int ttl, uint16_t total_len_bytes)
+{
+    if (packet_size < (int)sizeof(struct iphdr)) return -1;
+
+    struct iphdr *iph = (struct iphdr *)packet;
+    memset(iph, 0, sizeof(*iph));
+
+    iph->version = 4;
+    iph->ihl = 5;
+    iph->tos = 0;
+    iph->tot_len = htons(total_len_bytes);
+
+    static uint16_t ip_id = 0;
+    iph->id = htons(ip_id++);
+
+    iph->frag_off = htons(0);
+    iph->ttl = ttl;
+    iph->protocol = IPPROTO_TCP;
+    iph->check = 0;
+
+     if (inet_pton(AF_INET, src_ip, &iph->saddr) != 1) return -1;
+    if (inet_pton(AF_INET, dst_ip, &iph->daddr) != 1) return -1;
+
+    iph->check = calculate_checksum(iph, sizeof(struct iphdr));
+    return (int)sizeof(struct iphdr);
+}
+static uint16_t tcp_checksum(const struct iphdr *iph, const struct tcphdr *tcph,
+                             const void *payload, int payload_len)
+{
+    struct pseudo_header_tcp psh;
+    memset(&psh, 0, sizeof(psh));
+    psh.source_address = iph->saddr;
+    psh.dest_address = iph->daddr;
+    psh.placeholder = 0;
+    psh.protocol = IPPROTO_TCP;
+    psh.tcp_length = htons((uint16_t)(sizeof(struct tcphdr) + payload_len));
+
+    int psize = sizeof(psh) + sizeof(struct tcphdr) + payload_len;
+    char buf[4096];
+    if (psize > (int)sizeof(buf)) return 0;
+
+    memcpy(buf, &psh, sizeof(psh));
+    memcpy(buf + sizeof(psh), tcph, sizeof(struct tcphdr));
+    if (payload_len > 0 && payload) {
+        memcpy(buf + sizeof(psh) + sizeof(struct tcphdr), payload, payload_len);
+    }
+
+    return calculate_checksum(buf, psize);
+}
+// מקבלת את הבפאר ובונה לנו חבילה מלאה :
+//-IP Header
+//-TCP Header עם דגל SYN
+//מחשבת  TCP checksum /ומחזירה את אורך החבילה (בביטים) שניבנתה בפועל 
+
+int build_tcp_syn_packet(char *packet, int packet_size,
+                         const char *src_ip, const char *dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint32_t seq)
+{
+    if (!packet || !src_ip || !dst_ip) return -1;
+
+    int ip_len = (int)sizeof(struct iphdr);
+    int tcp_len = (int)sizeof(struct tcphdr);
+    int total_len = ip_len + tcp_len;
+    if (packet_size < total_len) return -1;
+
+    memset(packet, 0, total_len);
+
+    if (build_ipv4_header_tcp(packet, packet_size, src_ip, dst_ip, 64, (uint16_t)total_len) < 0)
+        return -1;
+
+    struct iphdr *iph = (struct iphdr *)packet;
+    struct tcphdr *tcph = (struct tcphdr *)(packet + ip_len);
+
+    memset(tcph, 0, sizeof(*tcph));
+    tcph->source = htons(src_port);
+    tcph->dest   = htons(dst_port);
+    tcph->seq    = htonl(seq);
+    tcph->ack_seq = htonl(0);
+    tcph->doff   = 5;
+
+    tcph->syn = 1;
+    tcph->window = htons(5840);
+    tcph->check = 0;
+
+    tcph->check = tcp_checksum(iph, tcph, NULL, 0);
+    return total_len;
+}
+int build_tcp_rst_packet(char *packet, int packet_size,
+                         const char *src_ip, const char *dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint32_t seq, uint32_t ack_seq)
+{
+    if (!packet || !src_ip || !dst_ip) return -1;
+
+    int ip_len = (int)sizeof(struct iphdr);
+    int tcp_len = (int)sizeof(struct tcphdr);
+    int total_len = ip_len + tcp_len;
+    if (packet_size < total_len) return -1;
+
+    memset(packet, 0, total_len);
+
+    if (build_ipv4_header_tcp(packet, packet_size, src_ip, dst_ip, 64, (uint16_t)total_len) < 0)
+        return -1;
+
+    struct iphdr *iph = (struct iphdr *)packet;
+    struct tcphdr *tcph = (struct tcphdr *)(packet + ip_len);
+      memset(tcph, 0, sizeof(*tcph));
+    tcph->source = htons(src_port);
+    tcph->dest   = htons(dst_port);
+    tcph->seq    = htonl(seq);
+    tcph->ack_seq = htonl(ack_seq);
+    tcph->doff   = 5;
+
+    tcph->rst = 1;
+    // אם יש ack_seq אז מקובל גם לשים ACK
+    if (ack_seq != 0) tcph->ack = 1;
+
+    tcph->window = htons(0);
+    tcph->check = 0;
+
+    tcph->check = tcp_checksum(iph, tcph, NULL, 0);
+    return total_len;
+}
+void parse_ip_tcp(const char *buf, struct iphdr **ip, struct tcphdr **tcp)
+{
+    *ip = (struct iphdr *)buf;
+    *tcp = (struct tcphdr *)(buf + (*ip)->ihl * 4);
 }
