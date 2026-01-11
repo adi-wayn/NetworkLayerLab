@@ -1,10 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
+
 // 1. Includes
 #include <stdint.h>
 #include <stddef.h>
 
 #include <arpa/inet.h>
 #include <poll.h>
-#include <sys/time.h>
+
 
 #include <netinet/in.h>     // חשוב שיהיה לפני tcp.h בהרבה מערכות
 #include <netinet/ip.h>
@@ -18,6 +20,7 @@
 #include <netinet/in.h>
 #include "../net_utils.h" 
 #include <unistd.h>   // בשביל close()
+#include <time.h>
 
 
 /*
@@ -26,11 +29,11 @@
  * Must be defined BEFORE including <netinet/tcp.h>.
  */
 #ifndef __FAVOR_BSD
-#define __FAVOR_BSD
 #endif
 
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+
 
 // 2. Defines & Structs
 // כאן תגדירי קבועים וגם את מבנה ה-Pseudo Header לחישוב Checksum של TCP/UDP
@@ -101,8 +104,18 @@ static uint32_t read_u32_net(const unsigned char *p) {
 #define TCP_FLAG_ACK 0x10
 #define TCP_FLAG_URG 0x20
 
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
+}
+
+
 // פונקציה שבונה ושולחת חבילת TCP SYN
 void scan_tcp_port(char *target_ip, int port) {
+    printf("[TCP] start port=%d\n", port);
+    fflush(stdout);
+
     // 1. יצירת Raw Socket
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (sock < 0) { perror("Socket creation failed"); return; }
@@ -113,11 +126,6 @@ void scan_tcp_port(char *target_ip, int port) {
         close(sock);
         return;
     }
-    // timeout 1s
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
     char src_ip[INET_ADDRSTRLEN];
     if (get_local_ip_for_target(target_ip, src_ip, sizeof(src_ip)) < 0) {
@@ -163,52 +171,104 @@ void scan_tcp_port(char *target_ip, int port) {
         close(sock);
         return;
     }
+    printf("[TCP] sent SYN to port %d (src_port=%u)\n",
+        port, (unsigned)src_port);
+    fflush(stdout);
+
 
     // קבלת התשובה
     char buffer[4096];
     struct sockaddr_in saddr;
     socklen_t saddr_size = sizeof(saddr);
 
-    int data_size = recvfrom(sock, buffer, sizeof(buffer), 0,
-                             (struct sockaddr*)&saddr, &saddr_size);
-    if (data_size <= 0) {
-        close(sock);
-        return;
-    }
+    // ---- קבלה וסינון בעזרת poll + deadline ----
+    uint32_t dst_ip_net = dest.sin_addr.s_addr;   // target ip (network order)
+    uint32_t src_ip_net = 0;
+    inet_pton(AF_INET, src_ip, &src_ip_net);      // our ip (network order)
 
-    // ===== Parse received packet (IP + TCP) without struct tcphdr =====
-    struct iphdr *rip = (struct iphdr *)buffer;
-    int ip_hdr_bytes = rip->ihl * 4;
-    if (data_size < ip_hdr_bytes + 20) {  // 20 = minimal TCP header
-        close(sock);
-        return;
-    }
+    int got_reply = 0;
 
-    unsigned char *tcp_ptr = (unsigned char *)buffer + ip_hdr_bytes;
+    // כמה זמן אנחנו מוכנים לחכות לתשובה לפורט הזה (לדוגמה 500ms)
+    const int WAIT_MS = 500;
+    long deadline = now_ms() + WAIT_MS;
 
-    uint16_t tcp_src_port = read_u16_net(tcp_ptr + TCP_OFF_SRC_PORT);
-    uint16_t tcp_dst_port = read_u16_net(tcp_ptr + TCP_OFF_DST_PORT);
-    uint32_t tcp_seq      = read_u32_net(tcp_ptr + TCP_OFF_SEQ);
+    while (now_ms() < deadline) {
+        int remaining = (int)(deadline - now_ms());
+        if (remaining < 0) remaining = 0;
 
-    uint8_t flags = *(uint8_t *)(tcp_ptr + TCP_OFF_FLAGS);
-    int syn = (flags & TCP_FLAG_SYN) != 0;
-    int ack = (flags & TCP_FLAG_ACK) != 0;
-    int rst = (flags & TCP_FLAG_RST) != 0;
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
 
-    // סינון - כדי לבדוק שהחבילה שקיבלנו באמת קשורה לסריקה שלנו
-    if (saddr.sin_addr.s_addr == dest.sin_addr.s_addr &&
-        tcp_src_port == (uint16_t)port &&
-        tcp_dst_port == src_port)
-    {
-        // SYN+ACK => הפורט פתוח
-        if (syn && ack) {
-            printf("Port %d is OPEN (TCP)\n", port);
+        int pr = poll(&pfd, 1, remaining);
+        if (pr == 0) {
+            // נגמר הזמן
+            break;
+        }
+        if (pr < 0) {
+            perror("[TCP] poll");
+            break;
+        }
+        if (!(pfd.revents & POLLIN)) {
+            continue;
+        }
 
-            // =================================================
-            // הדרישה במטלה: אחרי SYN-ACK חייבים לשלוח RST
-            // =================================================
-            uint32_t their_seq = tcp_seq;
-            uint32_t my_ack = their_seq + 1;
+        int data_size = recvfrom(sock, buffer, sizeof(buffer), 0,
+                                (struct sockaddr*)&saddr, &saddr_size);
+        if (data_size <= 0) {
+            // אם יש timeout על recvfrom זה יכול לקרות, פשוט ממשיכים
+            continue;
+        }
+
+        struct iphdr *rip = (struct iphdr *)buffer;
+
+        // רק TCP
+        if (rip->protocol != IPPROTO_TCP) {
+            continue;
+        }
+
+        int ip_hdr_bytes = rip->ihl * 4;
+        if (data_size < ip_hdr_bytes + 20) { // מינימום TCP header
+            continue;
+        }
+
+        unsigned char *tcp_ptr = (unsigned char *)buffer + ip_hdr_bytes;
+
+        uint16_t tcp_src_port = read_u16_net(tcp_ptr + TCP_OFF_SRC_PORT);
+        uint16_t tcp_dst_port = read_u16_net(tcp_ptr + TCP_OFF_DST_PORT);
+        uint32_t tcp_seq      = read_u32_net(tcp_ptr + TCP_OFF_SEQ);
+
+        uint8_t flags = *(uint8_t *)(tcp_ptr + TCP_OFF_FLAGS);
+        int syn = (flags & TCP_FLAG_SYN) != 0;
+        int ack = (flags & TCP_FLAG_ACK) != 0;
+        int rst = (flags & TCP_FLAG_RST) != 0;
+
+        // דילוג על החבילה שאנחנו שלחנו (יוצאת)
+        if (rip->saddr == src_ip_net && rip->daddr == dst_ip_net) {
+            continue;
+        }
+
+        // תשובה אמיתית מהיעד אלינו:
+        // יעד -> אנחנו, source port = port שסרקנו, dest port = src_port שלנו
+        if (rip->saddr == dst_ip_net &&
+            rip->daddr == src_ip_net &&
+            tcp_src_port == (uint16_t)port &&
+            tcp_dst_port == src_port)
+        {
+            got_reply = 1;
+
+            if (syn && ack) {
+                printf("Port %d is OPEN (TCP)\n", port);
+            } else if (rst) {
+                printf("Port %d is CLOSED (TCP)\n", port);
+            } else {
+                printf("Port %d got TCP reply (flags=0x%02x)\n", port, flags);
+            }
+            fflush(stdout);
+
+            // שולחים RST כדי לא להשאיר half-open (בעיקר אם SYN+ACK)
+            uint32_t my_ack = tcp_seq + 1;
             uint32_t my_seq = seq + 1;
 
             char rst_pkt[4096];
@@ -223,13 +283,17 @@ void scan_tcp_port(char *target_ip, int port) {
             );
 
             if (rst_len > 0) {
-                sendto(sock, rst_pkt, rst_len, 0, (struct sockaddr *)&dest, sizeof(dest));
+                sendto(sock, rst_pkt, rst_len, 0,
+                    (struct sockaddr *)&dest, sizeof(dest));
             }
+
+            break; // מצאנו תשובה לפורט הזה
         }
-        // RST => הפורט סגור
-        else if (rst) {
-            // printf("Port %d is CLOSED (TCP)\n", port);
-        }
+    }
+
+    if (!got_reply) {
+        printf("[TCP] no matching reply for port %d (timeout/filtered?)\n", port);
+        fflush(stdout);
     }
 
     close(sock);
@@ -336,6 +400,7 @@ void scan_udp_port(char *target_ip, int port) {
             struct iphdr   *outer_ip = NULL;
             struct icmphdr *icmp     = NULL;
 
+
             // פירוק IP + ICMP
             parse_ip_icmp(buf, &outer_ip, &icmp);
 
@@ -367,7 +432,7 @@ void scan_udp_port(char *target_ip, int port) {
                         // אם זה הפורט שסורקים – הוא סגור
                         if (dport == (uint16_t)port) {
                             // לא מדפיסים CLOSED כדי לא להציף
-                            // printf("Port %d is CLOSED (UDP)\n", port);
+                            printf("Port %d is CLOSED (UDP)\n", port);
                         }
                     }
                 }
@@ -417,7 +482,8 @@ int main(int argc, char *argv[]) {
     }
 
     // ===== Scan ports =====
-    for (int port = 1; port <= 65535; port++) {
+    for (int port = 80; port <= 443; port++) {
+
         if (scan_type == SCAN_TCP) {
             scan_tcp_port(target_ip, port);
         } else {
