@@ -1,89 +1,64 @@
-#######################################
-#  Makefile for the ping program.     #
-#  For: Computer Networks course.     #
-#######################################
+##########################################
+#  Makefile for the port_scanning program #
+#  For: Computer Networks course          #
+##########################################
 
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -std=c99 -pedantic -I..
+CFLAGS = -Wall -Wextra -Werror -std=c11 -pedantic -I..
 LDFLAGS = -lm
 
 RM = rm -f
 
-# Headers
-HEADERS = net_utils.h
+# ===== Files =====
+HEADERS = ../net_utils.h
 
-# Sources
-OBJS = ping.o net_utils.o
+# אם הקובץ שלך נקרא אחרת - תשני פה
+OBJS = port_scanning.o net_utils.o
 
-ping.o: ping.c ../net_utils.h
-	$(CC) $(CFLAGS) -c ping.c
-
-net_utils.o: ../net_utils.c ../net_utils.h
-	$(CC) $(CFLAGS) -c ../net_utils.c -o net_utils.o
-
-
-# Executable
-EXECS = ping
+# Executable name
+EXECS = port_scanning
 
 # Default arguments
 IP = 1.1.1.1
-COUNT = 4
+TYPE = TCP
 
-.PHONY: all default clean runp runpc runpf runpfc runsp
+.PHONY: all default clean run_tcp run_udp
 
 all: $(EXECS)
 default: all
 
+############
+# Compile  #
+############
+
+# קימפול הקובץ של הסורק (בתיקייה הנוכחית)
+port_scanning.o: port_scanning.c $(HEADERS)
+	$(CC) $(CFLAGS) -c port_scanning.c -o port_scanning.o
+
+# קימפול net_utils.c מהשורש (אצלך זה בשורש הפרויקט)
+net_utils.o: ../net_utils.c $(HEADERS)
+	$(CC) $(CFLAGS) -c ../net_utils.c -o net_utils.o
 
 ############
-# Programs #
+# Link     #
 ############
 
 $(EXECS): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+############
+# Run      #
+############
 
-################
-# Run programs #
-################
+run_tcp: $(EXECS)
+	sudo ./$(EXECS) -a $(IP) -t TCP
 
-# Run ping program in sudo mode (default: infinite)
-runp: $(EXECS)
-	sudo ./$< -a $(IP)
+run_udp: $(EXECS)
+	sudo ./$(EXECS) -a $(IP) -t UDP
 
-# Run ping with count (-c)
-runpc: $(EXECS)
-	sudo ./$< -a $(IP) -c $(COUNT)
-
-# Run ping with flood (-f)
-runpf: $(EXECS)
-	sudo ./$< -a $(IP) -f
-
-# Run ping with count + flood
-runpfc: $(EXECS)
-	sudo ./$< -a $(IP) -c $(COUNT) -f
-
-
-################
-# System Trace #
-################
-
-# System trace for default mode
-runsp: $(EXECS)
-	sudo strace ./$< -a $(IP)
-
-
-################
-# Object files #
-################
-
-%.o: %.c $(HEADERS)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-
-#################
-# Cleanup files #
-#################
+############
+# Clean    #
+############
 
 clean:
-	$(RM) *.o *.so $(EXECS)
+	$(RM) *.o $(EXECS)

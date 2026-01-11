@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <sys/socket.h>
 
+
+
 // ===== Checksum =====
 unsigned short int calculate_checksum(void *data, unsigned int bytes) {
 	unsigned short int *data_pointer = (unsigned short int *)data;

@@ -2,19 +2,37 @@
 #define NET_UTILS_H
 
 #include <stdint.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
-#include <netinet/tcp.h>
-#include <sys/time.h>
+#include <stddef.h>
+
 #include <arpa/inet.h>
 #include <poll.h>
-#include <netinet/in.h>
+#include <sys/time.h>
+
+#include <netinet/in.h>     // חשוב שיהיה לפני tcp.h בהרבה מערכות
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+
+
+/*
+ * On some systems, struct tcphdr layout/visibility depends on this.
+ * This helps keep tcphdr fields like source/dest/seq available.
+ */
+#ifndef __FAVOR_BSD
+#define __FAVOR_BSD
+#endif
+
+#include <netinet/tcp.h>
+
+/* Optional fallback for some Linux toolchains / headers setups */
+#if defined(__has_include)
+  #if __has_include(<linux/tcp.h>)
+    #include <linux/tcp.h>
+  #endif
+#endif
 
 /*
  * @brief Size of the buffer used to store the ICMP packet (including the header).
- * @note The buffer size is set to 1024 bytes, which is more than enough for the ICMP packet.
- * @attention The buffer size should be at least the size of the ICMP header, which is 8 bytes.
-*/
+ */
 #define BUFFER_SIZE 1024
 
 // ===== Checksum =====
@@ -42,6 +60,7 @@ int build_tcp_rst_packet(char *packet, int packet_size,
                          uint32_t seq, uint32_t ack_seq);
 
 void parse_ip_tcp(const char *buf, struct iphdr **ip, struct tcphdr **tcp);
+
 // ===== Time / RTT =====
 double time_diff_ms(const struct timeval *start, const struct timeval *end);
 
@@ -55,7 +74,6 @@ int recv_icmp_packet(int sock, char *buf, int bufsize,
                      struct sockaddr_in *src,
                      int timeout_ms);
 
-// extracts pointers inside recv buffer
 void parse_ip_icmp(const char *buf, struct iphdr **ip, struct icmphdr **icmp);
 
 // ===== Build IPv4 Header =====
