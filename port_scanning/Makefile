@@ -19,7 +19,7 @@ OBJS = port_scanning.o net_utils.o
 EXECS = port_scanning
 
 # Default arguments
-IP = 1.1.1.1
+IP = 8.8.8.8
 TYPE = TCP
 
 .PHONY: all default clean run_tcp run_udp

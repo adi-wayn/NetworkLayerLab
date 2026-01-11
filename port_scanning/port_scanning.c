@@ -1,17 +1,22 @@
 #define _POSIX_C_SOURCE 200809L
+#define MAX_OPEN_PORTS 1024
+
+// TCP header offsets (RFC793)
+#define TCP_OFF_SRC_PORT  0
+#define TCP_OFF_DST_PORT  2
+#define TCP_OFF_SEQ       4
+#define TCP_OFF_ACK       8
+#define TCP_OFF_DATAOFF   12  // upper 4 bits
+#define TCP_OFF_FLAGS     13
 
 // 1. Includes
 #include <stdint.h>
 #include <stddef.h>
-
 #include <arpa/inet.h>
 #include <poll.h>
-
-
 #include <netinet/in.h>     // חשוב שיהיה לפני tcp.h בהרבה מערכות
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +26,14 @@
 #include "../net_utils.h" 
 #include <unistd.h>   // בשביל close()
 #include <time.h>
+
+// Flags bits
+#define TCP_FLAG_FIN 0x01
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+#define TCP_FLAG_PSH 0x08
+#define TCP_FLAG_ACK 0x10
+#define TCP_FLAG_URG 0x20
 
 
 /*
@@ -35,37 +48,15 @@
 #include <netinet/udp.h>
 
 
-// 2. Defines & Structs
-// כאן תגדירי קבועים וגם את מבנה ה-Pseudo Header לחישוב Checksum של TCP/UDP
+typedef enum {
+    SCAN_TCP = 0,
+    SCAN_UDP = 1
+} scan_type_t;
 
-// 3. Helper Functions (פונקציות עזר)
-/*
- * @brief A checksum function that returns 16 bit checksum for data.
- * @param data The data to do the checksum for.
- * @param bytes The length of the data in bytes.
- * @return The checksum itself as 16 bit unsigned number.
- * * This function is taken from RFC1071.
- */
-unsigned short checksum(void *data, unsigned int bytes) {
-    unsigned short *data_pointer = (unsigned short *)data;
-    unsigned int total_sum = 0;
-
-    // Main summing loop
-    while (bytes > 1) {
-        total_sum += *data_pointer++;
-        bytes -= 2;
-    }
-
-    // Add left-over byte, if any
-    if (bytes > 0)
-        total_sum += *((unsigned char *)data_pointer);
-
-    // Fold 32-bit sum to 16 bits
-    while (total_sum >> 16)
-        total_sum = (total_sum & 0xFFFF) + (total_sum >> 16);
-
-    return (~((unsigned short)total_sum));
-}
+typedef struct {
+    int port;
+    scan_type_t type;
+} open_port_t;
 
 // מבנה עזר לחישוב Checksum של TCP
 struct pseudo_header {
@@ -75,6 +66,37 @@ struct pseudo_header {
     u_int8_t protocol;
     u_int16_t tcp_length;
 };
+
+static open_port_t open_ports[MAX_OPEN_PORTS];
+static int open_count = 0;
+
+static void record_open_port(scan_type_t type, int port) {
+    if (open_count >= MAX_OPEN_PORTS) return;
+
+    open_ports[open_count].type = type;
+    open_ports[open_count].port = port;
+    open_count++;
+}
+
+static void print_open_ports_summary(scan_type_t type) {
+    const char *name = (type == SCAN_UDP) ? "UDP" : "TCP";
+
+    printf("\n===== %s OPEN PORTS SUMMARY =====\n", name);
+
+    int printed = 0;
+    for (int i = 0; i < open_count; i++) {
+        if (open_ports[i].type == type) {
+            printf("%s port %d is OPEN\n", name, open_ports[i].port);
+            printed++;
+        }
+    }
+
+    if (printed == 0) {
+        printf("No %s open ports detected.\n", name);
+    }
+
+    printf("=================================\n");
+}
 
 // ===== TCP parsing helpers by offsets (no struct tcphdr dependency) =====
 static uint16_t read_u16_net(const unsigned char *p) {
@@ -87,22 +109,6 @@ static uint32_t read_u32_net(const unsigned char *p) {
     memcpy(&v, p, sizeof(v));
     return ntohl(v);
 }
-
-// TCP header offsets (RFC793)
-#define TCP_OFF_SRC_PORT  0
-#define TCP_OFF_DST_PORT  2
-#define TCP_OFF_SEQ       4
-#define TCP_OFF_ACK       8
-#define TCP_OFF_DATAOFF   12  // upper 4 bits
-#define TCP_OFF_FLAGS     13
-
-// Flags bits
-#define TCP_FLAG_FIN 0x01
-#define TCP_FLAG_SYN 0x02
-#define TCP_FLAG_RST 0x04
-#define TCP_FLAG_PSH 0x08
-#define TCP_FLAG_ACK 0x10
-#define TCP_FLAG_URG 0x20
 
 static long now_ms(void) {
     struct timespec ts;
@@ -260,6 +266,7 @@ void scan_tcp_port(char *target_ip, int port) {
 
             if (syn && ack) {
                 printf("Port %d is OPEN (TCP)\n", port);
+                record_open_port(SCAN_TCP, port);
             } else if (rst) {
                 printf("Port %d is CLOSED (TCP)\n", port);
             } else {
@@ -301,12 +308,13 @@ void scan_tcp_port(char *target_ip, int port) {
 
 // ======================================================
 // פונקציה לסריקת פורט UDP
-// שולחת UDP ריק ומחכה לתשובה:
-// 1) אם מגיע UDP מהיעד -> הפורט פתוח
-// 2) אם מגיע ICMP Port Unreachable -> הפורט סגור
-// 3) אם אין תשובה (timeout) -> נחשב כסגור / filtered
+// שולחת UDP "probe" ומחכה:
+// 1) UDP reply מהיעד -> OPEN
+// 2) ICMP Destination Unreachable / Port Unreachable -> CLOSED
+// 3) Timeout -> FILTERED (או OPEN|FILTERED)
 // ======================================================
 void scan_udp_port(char *target_ip, int port) {
+    printf("[UDP] start port=%d target=%s\n", port, target_ip);
 
     // ===== 0) בניית כתובת היעד =====
     struct sockaddr_in dest;
@@ -315,61 +323,83 @@ void scan_udp_port(char *target_ip, int port) {
     dest.sin_port   = htons((uint16_t)port);
 
     if (inet_pton(AF_INET, target_ip, &dest.sin_addr) != 1) {
-        perror("inet_pton");
+        perror("[UDP] inet_pton");
         return;
     }
 
     // ===== 1) יצירת Socket UDP לשליחת הבדיקה =====
     int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) {
-        perror("socket(UDP)");
+        perror("[UDP] socket(UDP)");
         return;
     }
 
-    // ===== 2) יצירת Raw Socket ל-ICMP =====
-    // נועד לתפוס הודעות "Port Unreachable"
-    // (דורש sudo)
-    int icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (icmp_sock < 0) {
-        perror("socket(ICMP RAW)");
+    // ===== 1.1) לבחור פורט מקור קבוע כדי לסנן ICMP כמו שצריך =====
+    // אפשר גם רנדומלי, אבל חייבים לשמור אותו כדי לזהות inner_udp->source
+    uint16_t src_port = (uint16_t)(40000 + (port % 2000)); // רק כדי לא להתנגש
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_port   = htons(src_port);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(udp_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        perror("[UDP] bind(udp_sock)");
         close(udp_sock);
         return;
     }
 
-    // ===== 3) שליחת חבילת UDP ריקה =====
-    // אין Payload – מספיק "לדפוק בדלת"
-    if (sendto(udp_sock, NULL, 0, 0,
-               (struct sockaddr *)&dest, sizeof(dest)) < 0) {
-        perror("sendto(UDP)");
+    // ===== 2) יצירת Raw Socket ל-ICMP (לתפוס Port Unreachable) =====
+    int icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (icmp_sock < 0) {
+        perror("[UDP] socket(ICMP RAW) (did you run with sudo?)");
+        close(udp_sock);
+        return;
+    }
+
+    // ===== 3) שליחת UDP probe =====
+    // אפשר payload קטן (לפעמים יותר טוב מ-0)
+    const char payload[] = "PING";
+    int sent = sendto(udp_sock, payload, (int)sizeof(payload), 0,
+                      (struct sockaddr *)&dest, sizeof(dest));
+    if (sent < 0) {
+        perror("[UDP] sendto(UDP)");
         close(icmp_sock);
         close(udp_sock);
         return;
     }
 
-    // ===== 4) המתנה לתשובה: UDP או ICMP =====
-    struct pollfd pfds[2];
+    printf("[UDP] sent probe to port %d (src_port=%u)\n",
+           port, (unsigned)src_port);
 
-    // UDP socket
+    // ===== 4) poll על שני sockets: UDP + ICMP =====
+    struct pollfd pfds[2];
     pfds[0].fd = udp_sock;
     pfds[0].events = POLLIN;
     pfds[0].revents = 0;
 
-    // ICMP socket
     pfds[1].fd = icmp_sock;
     pfds[1].events = POLLIN;
     pfds[1].revents = 0;
 
-    // Timeout של שנייה אחת
-    int ret = poll(pfds, 2, 1000);
-    if (ret <= 0) {
-        // Timeout / שגיאה → במטלה מתייחסים כ-filtered או סגור
+    const int TIMEOUT_MS = 500; // חצי שנייה
+    int ret = poll(pfds, 2, TIMEOUT_MS);
+    if (ret == 0) {
+        // Timeout: לא קיבלנו כלום
+        printf("[UDP] port %d: no reply (timeout) => CLOSED\n", port);
+        fflush(stdout);
+        close(icmp_sock);
+        close(udp_sock);
+        return;
+    }
+    if (ret < 0) {
+        perror("[UDP] poll");
         close(icmp_sock);
         close(udp_sock);
         return;
     }
 
-    // ===== 5) אם קיבלנו תשובת UDP =====
-    // זה אומר שיש שירות שמאזין -> הפורט פתוח
+    // ===== 5) אם קיבלנו UDP reply =====
     if (pfds[0].revents & POLLIN) {
         char buf[2048];
         struct sockaddr_in from;
@@ -378,9 +408,13 @@ void scan_udp_port(char *target_ip, int port) {
         int n = recvfrom(udp_sock, buf, sizeof(buf), 0,
                          (struct sockaddr *)&from, &fromlen);
 
-        if (n >= 0 &&
-            from.sin_addr.s_addr == dest.sin_addr.s_addr) {
-            printf("Port %d is OPEN (UDP)\n", port);
+        if (n >= 0 && from.sin_addr.s_addr == dest.sin_addr.s_addr) {
+            printf("[UDP] port %d: got UDP reply => OPEN\n", port);
+            record_open_port(SCAN_UDP, port);
+            fflush(stdout);
+        } else {
+            printf("[UDP] port %d: got UDP packet but not from target => ignore\n", port);
+            fflush(stdout);
         }
 
         close(icmp_sock);
@@ -389,54 +423,78 @@ void scan_udp_port(char *target_ip, int port) {
     }
 
     // ===== 6) אם קיבלנו ICMP =====
-    // נבדוק אם זו הודעת "Port Unreachable"
     if (pfds[1].revents & POLLIN) {
         char buf[4096];
         struct sockaddr_in src;
 
-        // פונקציה שכבר קיימת אצלך ב-net_utils
+        // recv_icmp_packet אצלך כבר עושה timeout פנימי,
+        // אבל פה כבר poll הבטיח שיש משהו, אז timeout לא קריטי
         int n = recv_icmp_packet(icmp_sock, buf, sizeof(buf), &src, 1000);
-        if (n > 0) {
-            struct iphdr   *outer_ip = NULL;
-            struct icmphdr *icmp     = NULL;
+        if (n <= 0) {
+            printf("[UDP] port %d: ICMP readable but failed to read => FILTERED?\n", port);
+            close(icmp_sock);
+            close(udp_sock);
+            return;
+        }
 
+        struct iphdr   *outer_ip = NULL;
+        struct icmphdr *icmp     = NULL;
+        parse_ip_icmp(buf, &outer_ip, &icmp);
 
-            // פירוק IP + ICMP
-            parse_ip_icmp(buf, &outer_ip, &icmp);
+        if (!icmp) {
+            printf("[UDP] port %d: could not parse ICMP => ignore\n", port);
+            fflush(stdout);
+            close(icmp_sock);
+            close(udp_sock);
+            return;
+        }
 
-            // ICMP Destination Unreachable (type=3)
-            // Port Unreachable (code=3)
-            if (icmp && icmp->type == 3 && icmp->code == 3) {
+        // ICMP Destination Unreachable (type=3), Port Unreachable (code=3)
+        if (icmp->type == 3 && icmp->code == 3) {
 
-                // בתוך ה-ICMP נמצא ה-IP המקורי + 8 בתים מה-UDP
-                unsigned char *inner =
-                    (unsigned char *)icmp + sizeof(struct icmphdr);
+            // בתוך ה-ICMP: original IP header + 8 bytes מה-transport
+            unsigned char *inner = (unsigned char *)icmp + sizeof(struct icmphdr);
 
-                int inner_len = n -
-                    ((outer_ip ? outer_ip->ihl * 4 : 0) +
-                     sizeof(struct icmphdr));
+            // נחשב כמה נשאר לנו לקרוא (לפי outer_ip)
+            int outer_ip_len = outer_ip ? (outer_ip->ihl * 4) : 0;
+            int inner_len = n - (outer_ip_len + (int)sizeof(struct icmphdr));
 
-                if (inner_len >= (int)sizeof(struct iphdr)) {
-                    struct iphdr *inner_ip = (struct iphdr *)inner;
-                    int inner_ip_len = inner_ip->ihl * 4;
+            if (inner_len >= (int)sizeof(struct iphdr)) {
+                struct iphdr *inner_ip = (struct iphdr *)inner;
+                int inner_ip_len = inner_ip->ihl * 4;
 
-                    // בדיקה שזה באמת UDP
-                    if (inner_ip->protocol == IPPROTO_UDP &&
-                        inner_len >= inner_ip_len + (int)sizeof(struct udphdr)) {
+                if (inner_ip->protocol == IPPROTO_UDP &&
+                    inner_len >= inner_ip_len + (int)sizeof(struct udphdr)) {
 
-                        struct udphdr *inner_udp =
-                            (struct udphdr *)(inner + inner_ip_len);
+                    struct udphdr *inner_udp = (struct udphdr *)(inner + inner_ip_len);
 
-                        uint16_t dport = ntohs(inner_udp->dest);
+                    uint16_t inner_sport = ntohs(inner_udp->source);
+                    uint16_t inner_dport = ntohs(inner_udp->dest);
 
-                        // אם זה הפורט שסורקים – הוא סגור
-                        if (dport == (uint16_t)port) {
-                            // לא מדפיסים CLOSED כדי לא להציף
-                            printf("Port %d is CLOSED (UDP)\n", port);
-                        }
+                    // זה החלק החשוב: לוודא שזה באמת ה-probe שלנו
+                    if (inner_sport == src_port && inner_dport == (uint16_t)port) {
+                        printf("[UDP] port %d: ICMP Port Unreachable => CLOSED\n", port);
+                        fflush(stdout);
+                    } else {
+                        printf("[UDP] port %d: ICMP Port Unreachable but not our probe "
+                               "(inner_sport=%u inner_dport=%u) => ignore\n",
+                               port, (unsigned)inner_sport, (unsigned)inner_dport);
+                        fflush(stdout);
                     }
+
+                } else {
+                    printf("[UDP] port %d: ICMP unreachable but inner is not UDP => ignore\n", port);
+                    fflush(stdout);
                 }
+            } else {
+                printf("[UDP] port %d: ICMP unreachable but inner too short => ignore\n", port);
+                fflush(stdout);
             }
+
+        } else {
+            printf("[UDP] port %d: got ICMP type=%u code=%u (not Port Unreachable) => ignore\n",
+                   port, (unsigned)icmp->type, (unsigned)icmp->code);
+            fflush(stdout);
         }
 
         close(icmp_sock);
@@ -444,15 +502,14 @@ void scan_udp_port(char *target_ip, int port) {
         return;
     }
 
+    // אם הגענו לכאן: poll חזר אבל בלי POLLIN (נדיר)
+    printf("[UDP] port %d: poll returned but no POLLIN => FILTERED?\n", port);
+    fflush(stdout);
+
     close(icmp_sock);
     close(udp_sock);
 }
 
-
-typedef enum {
-    SCAN_TCP,
-    SCAN_UDP
-} scan_type_t;
 
 int main(int argc, char *argv[]) {
     char *target_ip = NULL;
@@ -482,7 +539,7 @@ int main(int argc, char *argv[]) {
     }
 
     // ===== Scan ports =====
-    for (int port = 80; port <= 443; port++) {
+    for (int port = 1; port <= 65535; port++) {
 
         if (scan_type == SCAN_TCP) {
             scan_tcp_port(target_ip, port);
@@ -490,6 +547,8 @@ int main(int argc, char *argv[]) {
             scan_udp_port(target_ip, port);
         }
     }
+
+    print_open_ports_summary(scan_type);
 
     return 0;
 }
